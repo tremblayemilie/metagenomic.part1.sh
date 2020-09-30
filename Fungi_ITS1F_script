@@ -210,7 +210,7 @@ done
 #                     #
 #######################
 
-#the pipeline goes too fast so a sleep of 20s or a complete stop is required to avoid crashing further steps
+#the pipeline goes too fast so a sleep of 20s is required to avoid crashing further steps
 sleep 20s	 
 
 #######################
@@ -328,3 +328,8 @@ python /isilon/biodiversity/pipelines/qiime-1.7.0/biom-format-1.1.2-release/bin/
   -o "$otu"/"${its}"_otu_table_taxo.tsv \
   -b \
   --header_key="taxonomy"
+
+
+
+
+
