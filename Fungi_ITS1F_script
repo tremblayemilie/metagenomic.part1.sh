@@ -1,0 +1,330 @@
+#!/bin/bash
+
+# qsub specific commands
+#"smp" all cpu on same node vs "orte" anywhere
+
+#$ -N metageno
+#$ -S /bin/bash
+#$ -cwd
+#$ -pe smp 12
+#$ -j y
+
+
+#######################
+#                     #
+#    User Defined     #
+#                     #
+#######################
+
+
+#Base directory for your current analysis
+#all output files will be inside
+analysisFolder=""${HOME}"/Debbie-Pollen-Feb_2018/DP_ITS1F"
+
+cpu="12" #must match the "-pe smp" value at the begining of the script
+
+#original fastq files
+fastq=""${HOME}"/Debbie-Pollen-Feb_2018/merged" #change path if your fastq files are somewhere else
+
+#Where all scripts are
+scripts=""${HOME}"/scripts"
+
+#barcode information for all samples
+barcode="${HOME}/barcodes/barcodes_Debbie_pollen.txt"
+
+#QIIME metadata custom fields
+#add the column header to the variable. Use as many as needed.
+customFields=("CollectionDate")
+
+#Which ITS to analyze
+#its="ITS2"
+its="ITS1F"
+
+#Trimming parameters in mothur
+length=200 #minlength. Typically use IonTorrent 400bp sequences
+ambig=0 #max number of N
+homop=8 #max length of homopolymer (number of the same base repeated). Always "8" for IonTorrent data.
+
+#qiime path
+qiimePath="/isilon/biodiversity/pipelines/qiime-1.7.0/qiime-1.7.0-release/bin"
+
+#UNITE database
+unite=""${HOME}"/UNITE"
+
+
+#######################
+#                     #
+#   Data Stucture     #
+#                     #
+#######################
+
+
+
+#log
+log=""${analysisFolder}"/log.txt"
+
+#folder for renamed fastq files (symbolic links)
+renamedFastq=""${analysisFolder}"/fastq"
+modifiedFastq=""${analysisFolder}"/fastqHeader"
+fastaQual=""${analysisFolder}"/fastaQual"
+trimmed=""${analysisFolder}"/trimmed"
+qiime=""${analysisFolder}"/qiime"
+metadata=""${qiime}"/metadata"
+qiimeFasta=""${qiime}"/combinedFasta"
+itsFasta=""${qiime}"/its"
+otu=""${qiime}"/otu"
+
+
+#mothur command file
+mothurBatch=""${fastaQual}"/mothur_commands.txt"
+
+#if forlder does not exists, create it
+# -p -> create parent directories if they don't exist
+# "||" if test is false
+# "&&" if test is true
+[ -d "$renamedFastq" ] || mkdir -p "$renamedFastq"
+[ -d "$modifiedFastq" ] || mkdir -p "$modifiedFastq"
+[ -d "$fastaQual" ] || mkdir -p "$fastaQual"
+[ -d "$trimmed" ] || mkdir -p "$trimmed"
+[ -d "$qiime" ] || mkdir -p "$qiime"
+[ -d "$metadata" ] || mkdir -p "$metadata"
+[ -d "$qiimeFasta" ] || mkdir -p "$qiimeFasta"
+[ -d "$itsFasta" ] || mkdir -p "$itsFasta"
+[ -d "$otu" ] || mkdir -p "$otu"
+
+
+#######################
+#                     #
+#    Rename fastq     #
+#                     #
+#######################
+
+
+#change the names
+echo "Date: "$(date)"" | tee "$log" #create log file. Crush old one if exists
+echo "" >> "$log"
+echo "User: "$(whoami)"" | tee -a "$log"
+echo "" >> "$log"
+echo "This analysis is going to use the following files:" | tee -a "$log" 
+ 
+#Find all fastq files rercursively in a specfic location and create symbolic in analysis folder
+#Looking for One primer at the time
+for b in $(find "$fastq" -type f | grep -F ".fastq" | grep "$its") #look in folder recursively.
+do
+  name=$(basename "$b") #removes the leading path. Only keeps the file name.
+  ln -s "$b" "${renamedFastq}"/"$name" # create symbolic link in the analysis folder instead of copying the file from its original location
+  echo ""$b" -> "${renamedFastq}"/"$name"" | tee -a "$log" #will append the existing log file
+done
+
+
+#############################
+#                           #
+#  Rename headers in fastq  #
+#                           #
+#############################
+
+
+#Change fastq entry headers to include the file name
+# e.g. file name: abc.fastq;
+# @P03UN:100856:63398 -> @abc_P03UN:100856:63398
+#if you get "no mudule named eta" error, download this module for python and place in in you ngs-util folder, in the fastqutil subfolder. Boom it works.
+
+#create a list of fastq files to change header
+for m in $(find -L "$renamedFastq" -type f | grep ".fastq") #find fastq files recursively 
+do
+  outName="$(basename "$m")"
+  outNameNoExt="${outName%.*}"
+  #zcat "$m" | fastqutils tag -pre "${outNameNoExt}"\% /dev/stdin > "${modifiedFastq}"/"$outName"
+  fastqutils tag -pre "${outNameNoExt}"\% "$m" > "${modifiedFastq}"/"$outName"
+done
+
+
+###########################
+#                         #
+#  fastq -> fasta + qual  #
+#                         #
+###########################
+
+
+echo "" >> "$log"
+echo "Converting fastq to fasta + qual" | tee -a "$log"
+for c in $(find -L "$modifiedFastq" -type f | grep -F ".fastq" | grep "$its") #look in folder recursively.
+do
+  python "${scripts}"/fastqtofasta.py "$c"
+  mv "${modifiedFastq}"/*.fasta "$fastaQual"
+  mv "${modifiedFastq}"/*.qual "$fastaQual"
+done
+
+
+#######################
+#                     #
+#      Trimming       #
+#                     #
+#######################
+
+
+#quality trimm with mothur in batch mode
+
+for d in $(find "$fastaQual" -type f | grep -F ".fasta")
+do
+  qfile="${d%.*}".qual"" #the "%.*" removes extension file.fastq -> file
+  #create batch file
+  echo "set.dir(input="$fastaQual")" > "$mothurBatch"
+  echo "set.dir(output="$trimmed")" >> "$mothurBatch"
+  echo "set.dir(modifynames=F)" >> "$mothurBatch"
+  echo "trim.seqs(fasta="$d", qfile="$qfile", processors="$cpu", minlength="$length", maxambig="$ambig", maxhomop="$homop")" >> "$mothurBatch"
+
+  #run mothur
+  mothur "$mothurBatch"
+done
+
+#remove ".trim" in trimmed sequence name (.fasta and .qual)
+rename .trim.fasta .fasta "${trimmed}"/*.fasta
+rename .trim.qual .qual "${trimmed}"/*.qual
+
+#get summaries
+for e in $(find "$trimmed" -type f | grep -F ".fasta" | grep -v -F ".scrap.fasta") # -v -> exclude
+do
+  name="$(basename $e)"
+  nameNoExt="${name%.*}"
+  #create batch file
+  echo "set.dir(input="$trimmed")" > "$mothurBatch"
+  echo "set.dir(output="$trimmed")" >> "$mothurBatch"
+  echo "set.dir(modifynames=F)" >> "$mothurBatch"
+  echo "summary.seqs(fasta="$e", processors="$cpu")" >> "$mothurBatch"
+
+  #run mothur
+  mothur "$mothurBatch" | tee "${trimmed}"/"${nameNoExt}".summary.txt
+done
+
+#remove second part of fasta headers
+for f in $(find "$trimmed" -type f | grep -F ".fasta" | grep -v -F ".scrap.fasta") # -v -> exclude
+do
+  sed -i 's/%[^:]*//' "$f"
+done
+
+
+#######################
+#                     #
+#      Breath         #
+#                     #
+#######################
+
+#the pipeline goes too fast so a sleep of 20s or a complete stop is required to avoid crashing further steps
+sleep 20s	 
+
+#######################
+#                     #
+#      Metadata #
+#                     #
+#######################
+
+
+#create Metadata file for QIIME
+custom=$(echo "${customFields[@]}" | sed -e 's/ /\\t/g') #add custom
+echo -e "#SampleID\tBarcodeSequence\tLinkerPrimerSequence\tInputFileName\t"${custom}"\tDescription" > "${metadata}"/metadata.tsv
+
+for g in $(find "$trimmed" -type f | grep "fasta" | grep -v "scrap") # -v -> exclude
+do
+  name=$(basename "$g")
+  nameNoExt="${name%.*}"
+  #create array: a=(1 2 3 4)
+  #show content of array: echo "${a[@]}"
+  #t="${nameNoExt//-/ }"
+  #params=("${nameNoExt//-/ }") #${string//substring/replacement}
+  #echo "${params[@]}"
+  param1=$(cut <<< "$nameNoExt" -d "-" -f 1) #equals $(echo "$nameNoExt" | cut -d "-" -f 1)
+  param2=$(cut <<< "$nameNoExt" -d "-" -f 2)
+  param3=$(cut <<< "$nameNoExt" -d "-" -f 3 | sed -e 's/Run//') #only keep the number of the run
+
+  tempLine=$(cat "$barcode" | grep "$param1" | grep "$param2" | grep "$param3")
+  echo "$tempLine" | awk -v fileName="$name" -v sampleName="$its" -F $'\t' 'BEGIN {OFS = FS} {print $1, $3, $4, fileName, $1"-"sampleName}' >> "${metadata}/metadata.tsv"
+done
+
+
+#######################
+#                     #
+#        QIIME        #
+#                     #
+#######################
+
+
+#"activate" qiime 
+source /isilon/biodiversity/pipelines/qiime-1.7.0/activate.sh
+
+#check metadata file
+python "${qiimePath}"/check_id_map.py \
+  -m "${metadata}/metadata.tsv" \
+  -o "${metadata}" \
+  -B \
+  -j Description \
+  -s
+
+#Add qiime labels to fasta files
+python "${qiimePath}"/add_qiime_labels.py \
+  -m "${metadata}/metadata.tsv" \
+  -i "$trimmed" \
+  -c "InputFileName" \
+  -o "$qiimeFasta"
+
+#Extract ITS regions
+ITSx \
+  -i "${qiimeFasta}"/combined_seqs.fna \
+  -t F \
+  --cpu "$cpu" \
+  --multi_thread T \
+  --preserve T \
+  -o "${itsFasta}"/its
+
+#create a parameter file for "pick_otus" and "pick_open_reference_otus"
+echo "pick_open_reference_otus:min_otu_size 1" > "${otu}"/qiime_pick_open_ref.param
+echo "pick_open_reference_otus:suppress_taxonomy_assignment True" >> "${otu}"/qiime_pick_open_ref.param
+echo "pick_open_reference_otus:suppress_align_and_tree True" >> "${otu}"/qiime_pick_open_ref.param
+echo "pick_open_reference_otus:input_fps "${itsFasta}"/its.ITS1.fasta" >> "${otu}"/qiime_pick_open_ref.param
+echo "pick_open_reference_otus:reference_fps "$unite"" >> "${otu}"/qiime_pick_open_ref.param
+echo "pick_open_reference_otus:output_dir "$otu"" >> "${otu}"/qiime_pick_open_ref.param
+echo "pick_open_reference_otus:force True" >> "${otu}"/qiime_pick_open_ref.param
+echo "pick_otus:otu_picking_method uclust_ref" >> "${otu}"/qiime_pick_open_ref.param
+echo "pick_otus:minlen 129" >> "${otu}"/qiime_pick_open_ref.param
+
+#pick OTUs
+#Will generate some java errors. Émilie says not to worry about it!
+python "${qiimePath}"/pick_open_reference_otus.py \
+  -p "${otu}"/qiime_pick_open_ref.param \
+  -i "${itsFasta}"/its.ITS1.fasta \
+  -r "${unite}"/sh_refs_qiime_ver7_dynamic_s_01.12.2017.fasta \
+  -o "$otu" \
+  -f
+echo "Don't worry, be happy, says Émilie..."
+
+#Pick representative set of OTUs
+python "${qiimePath}"/pick_rep_set.py \
+  -i "${otu}"/final_otu_map.txt \
+  -f "${itsFasta}"/its.ITS1.fasta \
+  -o "$otu"/"${its}"_rep_set.fasta
+
+#Assign taxonomy with taxa file
+python "${qiimePath}"/assign_taxonomy.py \
+  -i "$otu"/"${its}"_rep_set.fasta \
+  -t "${unite}"/sh_taxonomy_qiime_ver7_dynamic_s_01.12.2017.txt \
+  -r "${unite}"/sh_refs_qiime_ver7_dynamic_s_01.12.2017.fasta \
+  -o "$otu"/"${its}"_blast_assigned_taxonomy \
+  -m blast
+
+#fix non ascii characters from UNITE database
+python "${scripts}"/parse_nonstandard_chars.py \
+ "$otu"/"${its}"_blast_assigned_taxonomy/"${its}"_rep_set_tax_assignments.txt \
+ > "$otu"/"${its}"_blast_assigned_taxonomy/"${its}"_rep_set_tax_assignments-clean.txt
+
+#Make OTU table
+python "${qiimePath}"/make_otu_table.py \
+  -i "${otu}"/final_otu_map.txt \
+  -o "$otu"/"${its}"_otu_table_taxo.biom \
+  -t "$otu"/"${its}"_blast_assigned_taxonomy/"${its}"_rep_set_tax_assignments-clean.txt
+
+#Convert biom file for RAM package in R
+python /isilon/biodiversity/pipelines/qiime-1.7.0/biom-format-1.1.2-release/bin/convert_biom.py \
+  -i "$otu"/"${its}"_otu_table_taxo.biom \
+  -o "$otu"/"${its}"_otu_table_taxo.tsv \
+  -b \
+  --header_key="taxonomy"
